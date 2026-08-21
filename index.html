@@ -419,39 +419,6 @@ function PropertyProfitCalculator() {
             </div>
           </section>
 
-          {/* WATERFALL */}
-          <section className="waterfall">
-            <div className="ledger-heading">How we got here</div>
-            {waterfallRows.map((r, i) => (
-              <div className="wf-row" key={i}>
-                <div className="wf-label">{r.label}</div>
-                <div className="wf-track">
-                  <div
-                    className={`wf-bar ${r.value >= 0 ? "in" : "out"}`}
-                    style={{ width: `${(Math.abs(r.value) / maxAbs) * 100}%` }}
-                  />
-                </div>
-                <div className={`wf-value ${r.value >= 0 ? "in" : "out"}`}>
-                  {r.value >= 0 ? "+" : "–"}
-                  {fmt(Math.abs(r.value))}
-                </div>
-              </div>
-            ))}
-            <div className="wf-row wf-total">
-              <div className="wf-label">Actual {isProfit ? "Profit" : "Loss"}</div>
-              <div className="wf-track">
-                <div
-                  className={`wf-bar ${isProfit ? "in" : "out"}`}
-                  style={{ width: `${(Math.abs(actualProfit) / maxAbs) * 100}%` }}
-                />
-              </div>
-              <div className={`wf-value ${isProfit ? "in" : "out"}`}>
-                {isProfit ? "+" : "–"}
-                {fmt(Math.abs(actualProfit))}
-              </div>
-            </div>
-          </section>
-
           {/* LEDGER TABLE */}
           <section className="ledger-grid">
             <div className="ledger-col">
@@ -488,6 +455,39 @@ function PropertyProfitCalculator() {
               {num(holding.otherCosts) > 0 && <Row label="Other Holding Costs" value={num(holding.otherCosts)} />}
               <Row label="Less: Rental Income Collected" value={-num(holding.rentCollected)} />
               <Row label="Total Cost of Ownership" value={totalCostOfOwnership} strong final />
+            </div>
+          </section>
+
+          {/* WATERFALL */}
+          <section className="waterfall">
+            <div className="ledger-heading">How we got here</div>
+            {waterfallRows.map((r, i) => (
+              <div className="wf-row" key={i}>
+                <div className="wf-label">{r.label}</div>
+                <div className="wf-track">
+                  <div
+                    className={`wf-bar ${r.value >= 0 ? "in" : "out"}`}
+                    style={{ width: `${(Math.abs(r.value) / maxAbs) * 100}%` }}
+                  />
+                </div>
+                <div className={`wf-value ${r.value >= 0 ? "in" : "out"}`}>
+                  {r.value >= 0 ? "+" : "–"}
+                  {fmt(Math.abs(r.value))}
+                </div>
+              </div>
+            ))}
+            <div className="wf-row wf-total">
+              <div className="wf-label">Actual {isProfit ? "Profit" : "Loss"}</div>
+              <div className="wf-track">
+                <div
+                  className={`wf-bar ${isProfit ? "in" : "out"}`}
+                  style={{ width: `${(Math.abs(actualProfit) / maxAbs) * 100}%` }}
+                />
+              </div>
+              <div className={`wf-value ${isProfit ? "in" : "out"}`}>
+                {isProfit ? "+" : "–"}
+                {fmt(Math.abs(actualProfit))}
+              </div>
             </div>
           </section>
 
