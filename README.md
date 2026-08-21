@@ -1,0 +1,1 @@
+Singapore property calculator that computes sales proceeds while factoring in cumulative rental income over time, target keywords focusing on net cash proceeds, CPF refunds, and total investment return.
