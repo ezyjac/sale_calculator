@@ -69,17 +69,28 @@ const ABSD_PROFILES = [
 ];
 
 const BUC_STAGES = [
-  { label: "Booking Fee (on OTP)", pct: 5 },
-  { label: "Exercise of Option to Purchase", pct: 15 },
-  { label: "Foundation Work", pct: 10 },
-  { label: "Reinforced Concrete Framework", pct: 10 },
-  { label: "Partition Walls", pct: 5 },
-  { label: "Roofing / Ceiling", pct: 5 },
-  { label: "Doors, Windows, Electrical & Plumbing", pct: 5 },
-  { label: "Car Park, Roads & Drains", pct: 5 },
-  { label: "Temporary Occupation Permit (TOP)", pct: 25 },
-  { label: "Certificate of Statutory Completion (CSC)", pct: 15 },
+  { label: "S&P / Option Exercise", pct: 20, duration: "At signing" },
+  { label: "Foundation", pct: 10, duration: "6–9 months" },
+  { label: "Reinforced Concrete Framework", pct: 10, duration: "6–9 months" },
+  { label: "Partition Walls", pct: 5, duration: "3–6 months" },
+  { label: "Ceiling", pct: 5, duration: "3–6 months" },
+  { label: "Doors & Windows", pct: 5, duration: "3–6 months" },
+  { label: "Car Park, Roads & Drains", pct: 5, duration: "3–6 months" },
+  { label: "Temporary Occupation Permit (TOP)", pct: 25, duration: "9–12 months" },
+  { label: "Certificate of Statutory Completion (CSC)", pct: 15, duration: "12 months" },
 ];
+
+// Cumulative % paid after each stage, and the % still outstanding/uncalled at that point —
+// used to drive quick presets for a subsale happening mid-construction.
+const BUC_STAGE_PRESETS = (() => {
+  let cum = 0;
+  const list = [{ label: "Before Booking Fee (nothing called yet)", outstandingPct: 100 }];
+  for (const s of BUC_STAGES) {
+    cum += s.pct;
+    list.push({ label: `After ${s.label} (${cum}% called)`, outstandingPct: Math.max(0, 100 - cum) });
+  }
+  return list;
+})();
 
 /* ---------------------------------------------------------------
    Calculation helpers
@@ -163,6 +174,77 @@ function amortize(principal, annualRatePct, tenureYears, monthsHeldRaw) {
 }
 
 
+/** Parses a stage duration string like "6–9 months" or "12 months" or "At signing"
+ *  into an estimated number of months (midpoint of any range found, 0 if none). */
+function parseDurationMonths(duration) {
+  const nums = (String(duration).match(/\d+/g) || []).map(Number);
+  if (nums.length === 0) return 0;
+  if (nums.length === 1) return nums[0];
+  return (nums[0] + nums[1]) / 2;
+}
+
+/** Builds an estimated calendar of loan disbursement events (month offset from purchase
+ *  date + amount) from a BUC stage list, treating each stage's duration as the time
+ *  elapsed since the previous stage (sequential), and flags which event corresponds to TOP. */
+function buildDisbursementEvents(stages, loanTotal) {
+  let cumMonths = 0;
+  return stages.map((s) => {
+    cumMonths += parseDurationMonths(s.duration);
+    return {
+      month: Math.round(cumMonths),
+      amount: (s.pct / 100) * loanTotal,
+      isTOP: /TOP|Temporary Occupation/i.test(s.label),
+    };
+  });
+}
+
+/** Progressive-disbursement mortgage simulation for a Building-Under-Construction purchase.
+ *  During construction the bank only disburses (and the buyer only pays interest on) the
+ *  loan portion of each certified stage — interest-only servicing, principal untouched.
+ *  From TOP onward it converts to a normal amortizing mortgage over the remaining tenure,
+ *  re-amortizing on any later top-up disbursement (e.g. at CSC). */
+function amortizeProgressive({ price, ltvPct, annualRatePct, tenureYears, monthsHeld, stages }) {
+  const loanTotal = ((Number(price) || 0) * (Number(ltvPct) || 0)) / 100;
+  const tenureMonths = Math.round((Number(tenureYears) || 0) * 12);
+  const r = (Number(annualRatePct) || 0) / 100 / 12;
+  const mHeld = Math.max(0, Math.round(monthsHeld || 0));
+
+  if (loanTotal <= 0 || tenureMonths <= 0 || mHeld <= 0) {
+    return { balance: 0, interestPaid: 0, disbursedToDate: 0, inAmortAtSale: false };
+  }
+
+  const events = buildDisbursementEvents(stages, loanTotal);
+
+  let balance = 0;
+  let interestPaid = 0;
+  let inAmort = false;
+  let instalment = 0;
+  let eventIdx = 0;
+
+  for (let m = 0; m <= mHeld; m++) {
+    while (eventIdx < events.length && events[eventIdx].month <= m) {
+      balance += events[eventIdx].amount;
+      if (events[eventIdx].isTOP) inAmort = true;
+      eventIdx++;
+      if (inAmort) {
+        const remainingMonths = Math.max(tenureMonths - m, 1);
+        instalment = r === 0 ? balance / remainingMonths : (balance * r) / (1 - Math.pow(1 + r, -remainingMonths));
+      }
+    }
+    if (m === 0 || balance <= 0) continue;
+    const interest = balance * r;
+    if (inAmort) {
+      const principal = Math.min(Math.max(instalment - interest, 0), balance);
+      balance -= principal;
+      interestPaid += interest;
+    } else {
+      interestPaid += interest; // interest-only servicing during construction — balance unchanged
+    }
+  }
+
+  return { balance, interestPaid, disbursedToDate: balance + 0, inAmortAtSale: inAmort };
+}
+
 const num = (v) => {
   const n = Number(String(v).replace(/[^0-9.-]/g, ""));
   return isNaN(n) ? 0 : n;
@@ -233,6 +315,10 @@ function PropertyProfitCalculator() {
     absdOverride: "",
     legalFeeBuy: "",
     renovation: "",
+    outstandingPct: "0",
+    outstandingAmtOverride: "",
+    outstandingSettledBySeller: false,
+    ltvPct: "75",
   });
 
   const [financing, setFinancing] = useState({
@@ -246,7 +332,11 @@ function PropertyProfitCalculator() {
   });
 
   const [holding, setHolding] = useState({
-    rentCollected: "",
+    rentStartDate: "",
+    rentEndDate: "",
+    monthlyRent: "",
+    rentCollectedOverride: "",
+    leasingCommission: "",
     propertyTax: "",
     maintenance: "",
     otherCosts: "",
@@ -282,7 +372,18 @@ function PropertyProfitCalculator() {
     return m && m > 0 ? m : 0;
   }, [deal.purchaseDate, deal.saleDate]);
 
-  const amort = amortize(financing.loanDrawn, financing.interestRate, financing.tenureYears, holdingMonths);
+  const effectiveLoanAmount = deal.isBUC ? (num(purchase.ltvPct) / 100) * num(purchase.price) : num(financing.loanDrawn);
+
+  const amort = deal.isBUC
+    ? amortizeProgressive({
+        price: purchase.price,
+        ltvPct: purchase.ltvPct,
+        annualRatePct: financing.interestRate,
+        tenureYears: financing.tenureYears,
+        monthsHeld: holdingMonths,
+        stages: BUC_STAGES,
+      })
+    : amortize(financing.loanDrawn, financing.interestRate, financing.tenureYears, holdingMonths);
   const outstandingLoanAuto = Math.round(amort.balance);
   const interestPaidAuto = Math.round(amort.interestPaid);
 
@@ -299,13 +400,50 @@ function PropertyProfitCalculator() {
   const cpfAccrued = financing.cpfAccruedOverride !== "" ? num(financing.cpfAccruedOverride) : cpfAccruedAuto;
   const cpfRefundTotal = num(financing.cpfPrincipal) + cpfAccrued;
 
+  const outstandingPct = num(purchase.outstandingPct);
+  const outstandingAmtAuto = Math.round((outstandingPct / 100) * num(purchase.price));
+  const outstandingAmt =
+    purchase.outstandingAmtOverride !== "" ? num(purchase.outstandingAmtOverride) : outstandingAmtAuto;
+  // Note: this amount is already embedded in "Purchase Price" above, so it never adds to
+  // Total Cost of Ownership / Actual Profit. It only ever affects the CASH the seller
+  // receives at completion, and only when explicitly marked as settled by the seller —
+  // otherwise (typical assignment/subsale) the incoming buyer takes it over directly with
+  // the developer and it must not be subtracted from the seller's proceeds at all.
+  const outstandingDeductedFromProceeds = deal.isBUC && purchase.outstandingSettledBySeller ? outstandingAmt : 0;
+
+  const capitalOutlaySchedule = useMemo(() => {
+    const ltv = num(purchase.ltvPct);
+    const price = num(purchase.price);
+    let cumPct = 0,
+      cumLoan = 0,
+      cumEquity = 0;
+    return BUC_STAGES.map((s) => {
+      cumPct += s.pct;
+      const stageAmt = (s.pct / 100) * price;
+      const loanPortion = (ltv / 100) * stageAmt;
+      const equityPortion = stageAmt - loanPortion;
+      cumLoan += loanPortion;
+      cumEquity += equityPortion;
+      return { ...s, cumPct, stageAmt, loanPortion, equityPortion, cumLoan, cumEquity };
+    });
+  }, [purchase.ltvPct, purchase.price]);
+
+  const rentEndDateEffective = holding.rentEndDate || deal.saleDate;
+  const rentMonths = useMemo(() => {
+    const m = monthsBetween(holding.rentStartDate, rentEndDateEffective);
+    return m && m > 0 ? m : 0;
+  }, [holding.rentStartDate, rentEndDateEffective]);
+  const rentCollectedAuto = Math.round(num(holding.monthlyRent) * rentMonths);
+  const rentCollected = holding.rentCollectedOverride !== "" ? num(holding.rentCollectedOverride) : rentCollectedAuto;
+  const netRentalIncome = rentCollected - num(holding.leasingCommission);
+
   const netHoldingCost =
     num(holding.propertyTax) +
     num(holding.maintenance) +
     interestPaid +
     cpfAccrued +
     num(holding.otherCosts) -
-    num(holding.rentCollected);
+    netRentalIncome;
 
   const totalCostOfOwnership = totalPurchaseInvestment + netHoldingCost;
 
@@ -314,10 +452,10 @@ function PropertyProfitCalculator() {
 
   const actualProfit = netSaleProceeds - totalCostOfOwnership;
 
-  const cashAtCompletion = num(sale.price) - totalSellingCosts - outstandingLoan - cpfRefundTotal;
+  const cashAtCompletion = num(sale.price) - totalSellingCosts - outstandingLoan - cpfRefundTotal - outstandingDeductedFromProceeds;
 
-  const cashInvested = totalCostOfOwnership - num(financing.loanDrawn);
-  const hasLoanDrawn = num(financing.loanDrawn) > 0;
+  const cashInvested = totalCostOfOwnership - effectiveLoanAmount;
+  const hasLoanDrawn = effectiveLoanAmount > 0;
 
   const roiUnlevered = totalCostOfOwnership > 0 ? (actualProfit / totalCostOfOwnership) * 100 : 0;
   const roiLevered = hasLoanDrawn && cashInvested > 0 ? (actualProfit / cashInvested) * 100 : null;
@@ -345,7 +483,8 @@ function PropertyProfitCalculator() {
     interestPaid > 0 ? { label: "Loan Interest Paid", value: -interestPaid, type: "out" } : null,
     cpfAccrued > 0 ? { label: "CPF Accrued Interest Payable", value: -cpfAccrued, type: "out" } : null,
     num(holding.otherCosts) > 0 ? { label: "Other Holding Costs", value: -num(holding.otherCosts), type: "out" } : null,
-    num(holding.rentCollected) > 0 ? { label: "Rental Income Collected", value: num(holding.rentCollected), type: "in" } : null,
+    rentCollected > 0 ? { label: "Rental Income Collected", value: rentCollected, type: "in" } : null,
+    num(holding.leasingCommission) > 0 ? { label: "Leasing Agent Commission", value: -num(holding.leasingCommission), type: "out" } : null,
   ].filter(Boolean);
 
   const maxAbs = Math.max(...waterfallRows.map((r) => Math.abs(r.value)), Math.abs(actualProfit), 1);
@@ -436,6 +575,13 @@ function PropertyProfitCalculator() {
                   sub={`Returned to CPF OA — not cash: principal ${fmt(num(financing.cpfPrincipal))} + accrued interest ${fmt(cpfAccrued)}`}
                 />
               )}
+              {outstandingDeductedFromProceeds > 0 && (
+                <Row
+                  label="Less: Outstanding Progressive Payment to Developer"
+                  value={-outstandingDeductedFromProceeds}
+                  sub="Settled by seller at completion — confirm against the completion account"
+                />
+              )}
               <Row label="Cash Received at Bank Account" value={cashAtCompletion} strong final />
             </div>
 
@@ -453,7 +599,8 @@ function PropertyProfitCalculator() {
                 <Row label="CPF Accrued Interest Payable" value={cpfAccrued} sub="Interest owed back to your own CPF OA, at 2.5% p.a." />
               )}
               {num(holding.otherCosts) > 0 && <Row label="Other Holding Costs" value={num(holding.otherCosts)} />}
-              <Row label="Less: Rental Income Collected" value={-num(holding.rentCollected)} />
+              <Row label="Less: Rental Income Collected" value={-rentCollected} />
+              {num(holding.leasingCommission) > 0 && <Row label="Leasing Agent Commission" value={num(holding.leasingCommission)} />}
               <Row label="Total Cost of Ownership" value={totalCostOfOwnership} strong final />
             </div>
           </section>
@@ -493,16 +640,67 @@ function PropertyProfitCalculator() {
 
           {deal.isBUC && (
             <section className="buc">
-              <div className="ledger-heading">Progressive Payment Schedule (Building Under Construction)</div>
-              <div className="buc-grid">
-                {BUC_STAGES.map((s) => (
-                  <div className="buc-item" key={s.label}>
-                    <span className="buc-pct">{s.pct}%</span>
-                    <span className="buc-label">{s.label}</span>
-                    <span className="buc-amt">{fmt((s.pct / 100) * num(purchase.price))}</span>
-                  </div>
-                ))}
+              <div className="ledger-heading">Progressive Payment Position</div>
+              <div className="wf-row" style={{ gridTemplateColumns: "210px 1fr 110px" }}>
+                <div className="wf-label">Outstanding / Uncalled Payment</div>
+                <div className="wf-track">
+                  <div className="wf-bar out" style={{ width: `${outstandingPct}%` }} />
+                </div>
+                <div className="wf-value out">{fmt(outstandingAmt)}</div>
               </div>
+              <p className="buc-note">
+                {fmtPct(outstandingPct, 0)} of the purchase price ({fmt(outstandingAmt)}) remains uncalled by the developer.{" "}
+                {purchase.outstandingSettledBySeller
+                  ? "This is settled by the seller at completion and has been deducted from cash proceeds above."
+                  : "This is taken over by the incoming buyer and paid directly to the developer — it is not deducted from the seller's proceeds. The completion account governs the actual distribution; please confirm the mechanics with the conveyancing solicitors."}
+              </p>
+              <div className="buc-grid" style={{ marginTop: 14 }}>
+                {(() => {
+                  const paidPct = 100 - outstandingPct;
+                  let cum = 0;
+                  return BUC_STAGES.map((s) => {
+                    cum += s.pct;
+                    const isPaid = cum <= paidPct + 0.001;
+                    return (
+                      <div className={`buc-item ${isPaid ? "paid" : "outstanding"}`} key={s.label}>
+                        <span className="buc-pct">{s.pct}%</span>
+                        <span className="buc-label">
+                          {s.label} <span className="buc-tag">{isPaid ? "paid" : "outstanding"}</span>
+                        </span>
+                        <span className="buc-amt">{fmt((s.pct / 100) * num(purchase.price))}</span>
+                      </div>
+                    );
+                  });
+                })()}
+              </div>
+
+              <div className="ledger-heading" style={{ marginTop: 26 }}>Your Actual Capital Outlay, Stage by Stage</div>
+              <p className="buc-note">
+                The bank only released loan funds as each construction milestone was certified, so the {fmtPct(100 - num(purchase.ltvPct), 0)} equity
+                portion was paid in step with the developer's billing — not as a single lump sum before TOP.
+              </p>
+              <table className="outlay-table">
+                <thead>
+                  <tr>
+                    <th>Stage</th>
+                    <th>Timing</th>
+                    <th>Called to date</th>
+                    <th>Your cash/CPF (cumulative)</th>
+                    <th>Bank loan (cumulative)</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {capitalOutlaySchedule.map((r) => (
+                    <tr key={r.label}>
+                      <td>{r.label}</td>
+                      <td>{r.duration}</td>
+                      <td>{r.cumPct}%</td>
+                      <td>{fmt(r.cumEquity)}</td>
+                      <td>{fmt(r.cumLoan)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             </section>
           )}
 
@@ -629,30 +827,136 @@ function PropertyProfitCalculator() {
                 onChange={(v) => setPurchase({ ...purchase, renovation: v })}
               />
             </div>
-            {deal.isBUC && purchase.price && (
+            {deal.isBUC && (
               <div className="buc-preview">
-                <div className="inline-note">Indicative progressive payment schedule</div>
-                <div className="buc-grid compact">
-                  {BUC_STAGES.map((s) => (
-                    <div className="buc-item" key={s.label}>
-                      <span className="buc-pct">{s.pct}%</span>
-                      <span className="buc-label">{s.label}</span>
-                      <span className="buc-amt">{fmt((s.pct / 100) * num(purchase.price))}</span>
-                    </div>
-                  ))}
+                <div className="inline-note" style={{ marginTop: 18 }}>Outstanding / Uncalled Progressive Payment</div>
+                <div className="grid-2" style={{ marginTop: 10 }}>
+                  <label className="field">
+                    <span className="field-label">Construction Stage Reached (preset)</span>
+                    <select
+                      className="field-input plain"
+                      value=""
+                      onChange={(e) => {
+                        if (e.target.value === "") return;
+                        setPurchase({ ...purchase, outstandingPct: e.target.value, outstandingAmtOverride: "" });
+                      }}
+                    >
+                      <option value="">Select a stage to auto-fill % outstanding…</option>
+                      {BUC_STAGE_PRESETS.map((p) => (
+                        <option key={p.label} value={p.outstandingPct}>
+                          {p.label} — {p.outstandingPct}% outstanding
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <Field
+                    label="% Outstanding"
+                    prefix="%"
+                    value={purchase.outstandingPct}
+                    onChange={(v) => setPurchase({ ...purchase, outstandingPct: v })}
+                  />
+                  <Field
+                    label="Outstanding / Uncalled Progressive Payment"
+                    value={purchase.outstandingAmtOverride}
+                    onChange={(v) => setPurchase({ ...purchase, outstandingAmtOverride: v })}
+                    placeholder={outstandingAmtAuto ? String(outstandingAmtAuto) : "0"}
+                    hint={`= ${fmtPct(outstandingPct, 0)} of purchase price. Already included in Purchase Price above — this does not add a new cost.`}
+                  />
                 </div>
+                <label className="checkbox-row" style={{ marginTop: 10 }}>
+                  <input
+                    type="checkbox"
+                    checked={purchase.outstandingSettledBySeller}
+                    onChange={(e) => setPurchase({ ...purchase, outstandingSettledBySeller: e.target.checked })}
+                  />
+                  <span>Seller settles this balance at completion (deduct from cash proceeds)</span>
+                </label>
+                <div className="inline-note warn" style={{ marginTop: 8 }}>
+                  {purchase.outstandingSettledBySeller
+                    ? "This amount will be deducted from cash proceeds at completion, like an outstanding loan."
+                    : "Left unchecked: assumes the incoming buyer takes over and pays this directly to the developer (typical for an assignment/subsale) — it will NOT be deducted from the seller's proceeds. The conveyancing completion account ultimately governs the actual distribution, so confirm the mechanics with the solicitors before presenting this to the seller."}
+                </div>
+
+                <div className="inline-note" style={{ marginTop: 18 }}>Standard Progressive Payment Schedule (reference)</div>
+                <div className="buc-grid compact">
+                  {(() => {
+                    const paidPct = 100 - outstandingPct;
+                    let cum = 0;
+                    return BUC_STAGES.map((s) => {
+                      cum += s.pct;
+                      const isPaid = cum <= paidPct + 0.001;
+                      return (
+                        <div className={`buc-item ${isPaid ? "paid" : "outstanding"}`} key={s.label}>
+                          <span className="buc-pct">{s.pct}%</span>
+                          <span className="buc-label">
+                            {s.label} <span className="buc-tag">{isPaid ? "paid" : "outstanding"}</span>
+                          </span>
+                          <span className="buc-amt">{fmt((s.pct / 100) * num(purchase.price))}</span>
+                        </div>
+                      );
+                    });
+                  })()}
+                </div>
+
+                <div className="inline-note" style={{ marginTop: 18 }}>Progressive Capital Outlay</div>
+                <div className="grid-2" style={{ marginTop: 10 }}>
+                  <Field
+                    label="Loan-to-Value (LTV)"
+                    prefix="%"
+                    value={purchase.ltvPct}
+                    onChange={(v) => setPurchase({ ...purchase, ltvPct: v })}
+                    hint="Bank only disburses this % of each stage — the rest is your cash/CPF, paid at that same stage"
+                  />
+                </div>
+                {purchase.price && (
+                  <div className="outlay-table-wrap">
+                    <table className="outlay-table">
+                      <thead>
+                        <tr>
+                          <th>Stage</th>
+                          <th>Timing</th>
+                          <th>Called to date</th>
+                          <th>Your cash/CPF (cumulative)</th>
+                          <th>Bank loan (cumulative)</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {capitalOutlaySchedule.map((r) => (
+                          <tr key={r.label}>
+                            <td>{r.label}</td>
+                            <td>{r.duration}</td>
+                            <td>{r.cumPct}%</td>
+                            <td>{fmt(r.cumEquity)}</td>
+                            <td>{fmt(r.cumLoan)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                    <div className="inline-note" style={{ marginTop: 8 }}>
+                      Shows that cash/CPF outlay builds up gradually alongside construction — not paid upfront at TOP.
+                    </div>
+                  </div>
+                )}
               </div>
             )}
           </Section>
 
           <Section eyebrow="Financing" title="Loan, Interest Rate & Tenure">
             <div className="grid-2">
-              <Field
-                label="Loan Amount Drawn at Purchase"
-                value={financing.loanDrawn}
-                onChange={(v) => setFinancing({ ...financing, loanDrawn: v })}
-                hint="Principal borrowed — also enables ROI on cash invested"
-              />
+              {deal.isBUC ? (
+                <div className="field">
+                  <span className="field-label">Loan Amount (from LTV × Purchase Price)</span>
+                  <div className="calc-readout">{fmt(effectiveLoanAmount)}</div>
+                  <span className="field-hint">Set the LTV % in the Progressive Payment section above — it drives the disbursement schedule below</span>
+                </div>
+              ) : (
+                <Field
+                  label="Loan Amount Drawn at Purchase"
+                  value={financing.loanDrawn}
+                  onChange={(v) => setFinancing({ ...financing, loanDrawn: v })}
+                  hint="Principal borrowed — also enables ROI on cash invested"
+                />
+              )}
               <Field
                 label="Interest Rate (% p.a.)"
                 value={financing.interestRate}
@@ -665,16 +969,22 @@ function PropertyProfitCalculator() {
                 onChange={(v) => setFinancing({ ...financing, tenureYears: v })}
                 prefix=""
               />
-              <div className="field">
-                <span className="field-label">Monthly Instalment (calculated)</span>
-                <div className="calc-readout">{fmt(amort.installment)}</div>
-              </div>
+              {!deal.isBUC && (
+                <div className="field">
+                  <span className="field-label">Monthly Instalment (calculated)</span>
+                  <div className="calc-readout">{fmt(amort.installment)}</div>
+                </div>
+              )}
               <Field
                 label="Outstanding Loan to Redeem at Sale"
                 value={financing.outstandingOverride}
                 onChange={(v) => setFinancing({ ...financing, outstandingOverride: v })}
                 placeholder={outstandingLoanAuto ? String(outstandingLoanAuto) : "0"}
-                hint={`Auto-calculated from rate & tenure over ${holdingMonths ? holdingMonths.toFixed(0) : 0} months held: ${fmt(outstandingLoanAuto)}`}
+                hint={
+                  deal.isBUC
+                    ? `Auto-calculated from progressive disbursement over ${holdingMonths ? holdingMonths.toFixed(0) : 0} months held: ${fmt(outstandingLoanAuto)}`
+                    : `Auto-calculated from rate & tenure over ${holdingMonths ? holdingMonths.toFixed(0) : 0} months held: ${fmt(outstandingLoanAuto)}`
+                }
               />
               <Field
                 label="Total Loan Interest Paid (holding period)"
@@ -700,18 +1010,62 @@ function PropertyProfitCalculator() {
             {cpfRefundTotal > 0 && (
               <div className="inline-note">Total CPF refund due on sale: {fmt(cpfRefundTotal)} (returned to your CPF OA, not received as cash)</div>
             )}
-            {financing.loanDrawn && (!financing.interestRate || !financing.tenureYears) && (
+            {deal.isBUC && (
+              <div className="inline-note">
+                {amort.inAmortAtSale
+                  ? "Sold after TOP: modelled as interest-only during construction, converting to full principal & interest instalments from TOP — re-amortized at CSC when the final tranche was disbursed."
+                  : "Sold before TOP: modelled as interest-only on the loan disbursed to date at each construction stage — no principal has been repaid yet, so the outstanding loan equals the amount disbursed so far."}
+              </div>
+            )}
+            {!deal.isBUC && financing.loanDrawn && (!financing.interestRate || !financing.tenureYears) && (
               <div className="inline-note warn">Enter interest rate and tenure to auto-calculate the loan breakdown, or fill in the outstanding loan and interest fields directly.</div>
             )}
           </Section>
 
           <Section eyebrow="Holding Period" title="Rental Income & Running Costs">
+            <div className="inline-note">Rental Income Calculator</div>
             <div className="grid-2">
+              <label className="field">
+                <span className="field-label">Rent Start Date</span>
+                <input
+                  className="field-input plain"
+                  type="date"
+                  value={holding.rentStartDate}
+                  onChange={(e) => setHolding({ ...holding, rentStartDate: e.target.value })}
+                />
+              </label>
+              <label className="field">
+                <span className="field-label">Rent End Date</span>
+                <input
+                  className="field-input plain"
+                  type="date"
+                  value={holding.rentEndDate}
+                  onChange={(e) => setHolding({ ...holding, rentEndDate: e.target.value })}
+                />
+                <span className="field-hint">{holding.rentEndDate ? "" : deal.saleDate ? `Defaults to sale completion date (${deal.saleDate})` : "Defaults to sale completion date"}</span>
+              </label>
+              <Field
+                label="Rent Per Month"
+                value={holding.monthlyRent}
+                onChange={(v) => setHolding({ ...holding, monthlyRent: v })}
+              />
               <Field
                 label="Total Rental Income Collected"
-                value={holding.rentCollected}
-                onChange={(v) => setHolding({ ...holding, rentCollected: v })}
+                value={holding.rentCollectedOverride}
+                onChange={(v) => setHolding({ ...holding, rentCollectedOverride: v })}
+                placeholder={rentCollectedAuto ? String(rentCollectedAuto) : "0"}
+                hint={`Auto-calculated over ${rentMonths.toFixed(0)} month(s): ${fmt(rentCollectedAuto)} — overwrite if the unit had vacant periods or rent changed`}
               />
+              <Field
+                label="Leasing Agent Commission Paid"
+                value={holding.leasingCommission}
+                onChange={(v) => setHolding({ ...holding, leasingCommission: v })}
+                hint="Typical SG market rate: ~1 month's rent per 2-yr lease, ~0.5 month per 1-yr lease — add up all tenancies signed during the holding period"
+              />
+            </div>
+
+            <div className="inline-note" style={{ marginTop: 18 }}>Running Costs</div>
+            <div className="grid-2">
               <Field
                 label="Total Property Tax Paid"
                 value={holding.propertyTax}
@@ -893,6 +1247,12 @@ select.field-input.plain { appearance: none; cursor: pointer; }
 .buc-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px 16px; margin-top: 8px; }
 .buc-grid.compact { grid-template-columns: 1fr; }
 .buc-item { display: flex; align-items: baseline; gap: 10px; font-size: 12.5px; padding: 6px 0; border-bottom: 1px dashed #24313F; }
+.buc-item.paid { opacity: 0.55; }
+.buc-tag { font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.08em; padding: 1px 6px; border-radius: 4px; margin-left: 6px; }
+.buc-item.paid .buc-tag { background: rgba(76,175,125,0.15); color: #4CAF7D; }
+.buc-item.outstanding .buc-tag { background: rgba(217,105,79,0.15); color: #D9694F; }
+.buc .buc-item.paid .buc-tag { background: rgba(47,107,79,0.12); color: #2F6B4F; }
+.buc .buc-item.outstanding .buc-tag { background: rgba(168,69,47,0.12); color: #A8452F; }
 .buc-pct { font-family: 'IBM Plex Mono', monospace; color: #C4993D; width: 34px; flex-shrink: 0; }
 .buc-label { flex: 1; color: #AEB8C4; }
 .buc-amt { font-family: 'IBM Plex Mono', monospace; color: #EDEAE0; }
@@ -970,6 +1330,24 @@ select.field-input.plain { appearance: none; cursor: pointer; }
 .row-final .row-label, .row-final .row-value { font-family: 'Fraunces', serif; font-size: 17px; }
 
 .buc { border-top: 1px solid #D9CFAF; padding-top: 24px; margin-top: 10px; }
+
+.outlay-table-wrap { margin-top: 12px; overflow-x: auto; }
+.outlay-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.outlay-table th, .outlay-table td { padding: 7px 10px; text-align: right; white-space: nowrap; }
+.outlay-table th:first-child, .outlay-table td:first-child { text-align: left; }
+.outlay-table th:nth-child(2), .outlay-table td:nth-child(2) { text-align: left; }
+.ledger-root .outlay-table th { font-family: 'IBM Plex Mono', monospace; font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; color: #6B7A8C; border-bottom: 1px solid #2A3A4D; }
+.ledger-root .outlay-table td { font-family: 'IBM Plex Mono', monospace; color: #EDEAE0; border-bottom: 1px dashed #24313F; }
+.ledger-root .outlay-table td:first-child { font-family: 'Inter', sans-serif; color: #AEB8C4; }
+.deed .outlay-table { margin-top: 14px; }
+.deed .outlay-table th { font-family: 'IBM Plex Mono', monospace; font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; color: #9C6B2E; border-bottom: 1px solid #D9CFAF; }
+.deed .outlay-table td { font-family: 'IBM Plex Mono', monospace; color: #1B2430; border-bottom: 1px dashed #DED4B4; }
+.deed .outlay-table td:first-child { font-family: 'Inter', sans-serif; color: #3E4A44; }
+.buc .buc-item { border-bottom-color: #DED4B4; }
+.buc .buc-label { color: #3E4A44; }
+.buc .buc-amt { color: #1B2430; }
+.buc-note { font-size: 12.5px; color: #6B7360; line-height: 1.6; margin: 10px 0 0; }
+.buc .wf-track { background: #E4DCC4; }
 
 .deed-footer { margin-top: 40px; }
 .deed-footer p { font-size: 11px; color: #8A8570; line-height: 1.6; margin: 4px 0; }
